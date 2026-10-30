@@ -1,0 +1,329 @@
+Below are the final versions of everything. Each block says where it goes, and nothing else in `Data_Server.py` needs to change.
+
+## 1. Cache and helper
+
+Put this above `_scope()`, in the "RESOLVE THE CALLER'S SCOPE" section.
+
+```python
+import time
+
+# Which tables also show "shared" workcenters. Keep this to WorkCenter only,
+# otherwise equipment/maintenance endpoints would leak other plants' machines.
+SHARED_VISIBLE = (WorkCenter,)
+
+_shared_cache = {}      # (plants, floors) -> (expires_at, codes, names)
+SHARED_TTL = 60         # seconds
+
+
+def compute_shared_wc(db, plants, floors, wc_codes, wc_names):
+    """
+    Workcenters (of any plant) that the shopfloor admin's products depend on,
+    excluding the admin's own workcenters.
+    Chain: product -> ProductWorkflowMapping -> stage -> Equipments -> (plant, workcenter_name) -> WorkCenter.workcenter_code
+    Returns ({plant: [workcenter_code]}, {plant: [workcenter_name]})
+    """
+    key = (tuple(sorted(plants)), tuple(sorted(floors)))
+    hit = _shared_cache.get(key)
+    if hit and hit[0] > time.time():
+        return hit[1], hit[2]
+
+    # 1) products of my shopfloor(s)
+    my_parts = {p for (p,) in db.query(ProductTypeMaster.part_number).filter(
+        ProductTypeMaster.plant_code.in_(plants),
+        ProductTypeMaster.shopfloor.in_(floors),
+    ).all()}
+
+    # fallback: products that pass through a stage having equipment in MY workcenters
+    if not my_parts:
+        own_stages = set()
+        for p, names in wc_names.items():
+            own_stages.update(s for (s,) in db.query(Equipments.stage_id).filter(
+                Equipments.plant_code == p,
+                Equipments.workcenter_name.in_(names),
+                Equipments.stage_id.isnot(None),
+            ).distinct().all())
+        if own_stages:
+            my_parts = {p for (p,) in db.query(ProductWorkflowMapping.product_part_number).filter(
+                ProductWorkflowMapping.flow_step_id.in_(own_stages),
+            ).distinct().all()}
+
+    codes, names_out = {}, {}
+    if my_parts:
+        # 2) stages of those products
+        stage_ids = [s for (s,) in db.query(ProductWorkflowMapping.flow_step_id).filter(
+            ProductWorkflowMapping.product_part_number.in_(my_parts),
+        ).distinct().all() if s is not None]
+
+        # 3) workcenters of the machines on those stages
+        pairs = []
+        if stage_ids:
+            pairs = db.query(Equipments.plant_code, Equipments.workcenter_name).filter(
+                Equipments.stage_id.in_(stage_ids),
+                Equipments.workcenter_name.isnot(None),
+                Equipments.plant_code.isnot(None),
+            ).distinct().all()
+
+        by_plant = {}
+        for pc, wn in pairs:
+            by_plant.setdefault(pc, set()).add(wn)
+
+        # 4) (plant, name) -> workcenter_code; drop my own workcenters
+        for pc, nm in by_plant.items():
+            rows = db.query(WorkCenter.workcenter_code, WorkCenter.workcenter_name).filter(
+                WorkCenter.plant_code == pc,
+                WorkCenter.workcenter_name.in_(list(nm)),
+            ).all()
+            for code, name in rows:
+                if code and code not in wc_codes.get(pc, []):
+                    codes.setdefault(pc, set()).add(code)
+                    if name:
+                        names_out.setdefault(pc, set()).add(name)
+
+    codes = {k: sorted(v) for k, v in codes.items()}
+    names_out = {k: sorted(v) for k, v in names_out.items()}
+    _shared_cache[key] = (time.time() + SHARED_TTL, codes, names_out)
+    return codes, names_out
+```
+
+## 2. `_scope()`: full replacement
+
+```python
+def _scope(**kw):
+    s = {
+        "unrestricted": False,   # True only for SUPER_ADMIN_IDS
+        "deny_all": False,       # True => user sees nothing
+        "rank": -1,
+        "access_levels": [],
+        "plants": [],
+        "plant_floors": {},      # plant -> [shopfloors]  or None (= all shopfloors)
+        "plant_wc_codes": {},    # plant -> [workcenter_code] (only for floor-restricted plants)
+        "plant_wc_names": {},    # plant -> [workcenter_name]
+        "shared_wc_codes": {},   # NEW: plant -> [workcenter_code] shared with this shopfloor admin
+        "shared_wc_names": {},   # NEW: plant -> [workcenter_name]
+        "companies": [],         # only for tables that have no plant column (unused for now)
+        "sbus": [],
+    }
+    s.update(kw)
+    return s
+```
+
+## 3. `get_scope()`: full replacement
+
+Only the shared block and the last `return` differ from your current version.
+
+```python
+def get_scope(payload=Depends(verify_token)):
+    """
+    userProfiles.access_level says HOW the user's access is defined:
+        Company    -> company_code (or company): every plant under that company
+        SBU        -> sbu: every plant of that SBU, plus every row/user carrying that SBU text
+        Plant      -> plant_code (one or many), all shopfloors
+        Shopfloor  -> plant_code + shopfloor (+ workcenters shared with his products)
+    Anything else / empty => no access.  Super admins come from SUPER_ADMIN_IDS.
+    """
+    if not isinstance(payload, dict):
+        return None                       # JWT validation off and no readable token (dev only)
+
+    staff = payload.get("id")
+    if not staff:
+        return _scope(deny_all=True)
+
+    db = session()                        # plain session: no scope attached, so no recursion
+    try:
+        u = db.query(UserProfile).filter(UserProfile.userID == staff).first()
+        if u is None:
+            return _scope(deny_all=True)
+
+        if str(staff) in SUPER_ADMIN_IDS:
+            return _scope(unrestricted=True, rank=ACCESS_RANK["super_admin"],
+                          access_levels=["super_admin"])
+
+        level = _normalize_level(u.access_level)
+        if level not in SCOPE_TYPES:
+            return _scope(deny_all=True, access_levels=[level])
+
+        plants, floors, sbu_list = [], [], []
+
+        if level == "company":
+            codes = to_list(u.company_code) or to_list(u.company)
+            if codes:
+                cond = or_(*[Plant.company.like(f"{c}%") for c in codes])
+                plants = [p for (p,) in db.query(Plant.plant_code).filter(cond).all()]
+
+        elif level == "sbu":
+            sbu_list = to_list(u.sbu)
+            if sbu_list:
+                # 1) plants whose plants.sbu contains the SBU text or its numeric code
+                keys = set(sbu_list)
+                for s in sbu_list:
+                    keys.update(re.findall(r"\d{3,}", s))        # "Components-9150" -> "9150"
+                cond = or_(*[Plant.sbu.like(f"%{k}%") for k in keys])
+                plants += [p for (p,) in db.query(Plant.plant_code).filter(cond).all()]
+
+                # 2) plants of every user that belongs to the same SBU
+                for (pc,) in db.query(UserProfile.plant_code).filter(UserProfile.sbu.in_(sbu_list)).all():
+                    plants += to_list(pc)
+
+            # 3) the admin's own plant(s)
+            plants += to_list(u.plant_code)
+
+        elif level == "plant":
+            plants = to_list(u.plant_code)
+
+        elif level == "shopfloor":
+            plants = to_list(u.plant_code)
+            floors = to_list(u.shopfloor)
+            if not floors:                                   # never widen to the whole plant
+                return _scope(deny_all=True, access_levels=[level])
+
+        plants = list(dict.fromkeys(plants))                 # de-duplicate, keep order
+
+        # An SBU admin is allowed even with no plants: SBU-column filtering still applies
+        if not plants and not sbu_list:
+            return _scope(deny_all=True, access_levels=[level])
+
+        wc_codes, wc_names = {}, {}
+        if floors:
+            for p in plants:
+                q = db.query(WorkCenter.workcenter_code, WorkCenter.workcenter_name).filter(
+                    WorkCenter.plant_code == p,
+                    WorkCenter.shopfloor_name.in_(floors),
+                )
+                for code, name in q.all():
+                    if code:
+                        wc_codes.setdefault(p, []).append(code)
+                    if name:
+                        wc_names.setdefault(p, []).append(name)
+
+        # ---- NEW: workcenters shared with this shopfloor admin ----
+        shared_codes, shared_names = {}, {}
+        if floors:
+            shared_codes, shared_names = compute_shared_wc(db, plants, floors, wc_codes, wc_names)
+
+        return _scope(
+            rank=LEVEL_RANK[level],
+            access_levels=[level],
+            plants=plants,
+            sbus=sbu_list,
+            plant_floors={p: (sorted(floors) if floors else None) for p in plants},
+            plant_wc_codes=wc_codes,
+            plant_wc_names=wc_names,
+            shared_wc_codes=shared_codes,       # NEW
+            shared_wc_names=shared_names,       # NEW
+        )
+    finally:
+        db.close()
+```
+
+## 4. `_plant_clause()`: full replacement
+
+Delete the commented-out old version too if you like. Only the live function needs replacing.
+
+```python
+def _plant_clause(M, cols, scope):
+    plant_col = getattr(M, cols["plant"])
+    floor_col = getattr(M, cols["shopfloor"]) if "shopfloor" in cols else None
+    code_col = getattr(M, cols["workcenter_code"]) if "workcenter_code" in cols else None
+    name_col = getattr(M, cols["workcenter_name"]) if "workcenter_name" in cols else None
+
+    per_plant = []
+    for p in scope["plants"]:
+        floors = scope["plant_floors"].get(p)
+        if floors is None:                                   # whole plant
+            per_plant.append(plant_col == p)
+        elif floor_col is not None:
+            per_plant.append(and_(plant_col == p, floor_col.in_(floors)))
+        elif code_col is not None:
+            per_plant.append(and_(plant_col == p, code_col.in_(scope["plant_wc_codes"].get(p, []))))
+        elif name_col is not None:
+            per_plant.append(and_(plant_col == p, name_col.in_(scope["plant_wc_names"].get(p, []))))
+        else:                                                # table has no floor info
+            per_plant.append(plant_col == p)
+
+    # ---- NEW: workcenters shared with me (matched on plant + workcenter_code) ----
+    if M in SHARED_VISIBLE:
+        if code_col is not None:
+            for p, codes in scope.get("shared_wc_codes", {}).items():
+                if codes:
+                    per_plant.append(and_(plant_col == p, code_col.in_(codes)))
+        elif name_col is not None:
+            for p, names in scope.get("shared_wc_names", {}).items():
+                if names:
+                    per_plant.append(and_(plant_col == p, name_col.in_(names)))
+
+    return or_(*per_plant) if per_plant else false()
+```
+
+## 5. Workcenter endpoints
+
+Replace the `GET`, `PUT` and `DELETE` at the bottom of the file (around line 25229). `POST` stays as it is.
+
+```python
+def _is_own_wc(wc, scope) -> bool:
+    """True if the workcenter is in the caller's own plant/shopfloor (not merely shared with him)."""
+    if scope is None or scope["unrestricted"]:
+        return True
+    if wc.plant_code not in scope["plants"]:
+        return False
+    floors = scope["plant_floors"].get(wc.plant_code)
+    return floors is None or wc.shopfloor_name in floors
+
+
+@app.get("/api/workcenters")
+def get_workcenters(db: Session = Depends(init_db), token_data=Depends(verify_token)):
+    scope = db.info.get("scope")
+    return [
+        {
+            "id": wc.id,
+            "workcenter_code": wc.workcenter_code,
+            "workcenter_name": wc.workcenter_name,
+            "shopfloor_name": wc.shopfloor_name,
+            "plant_code": wc.plant_code,
+            "is_shared": not _is_own_wc(wc, scope),    # UI: show read-only
+        }
+        for wc in db.query(WorkCenter).all()
+    ]
+
+
+# POST /api/workcenters stays exactly as it is
+
+
+@app.put("/api/workcenters/{wc_id}")
+def update_workcenter(wc_id: int, payload: dict, db: Session = Depends(init_db), token_data=Depends(verify_token)):
+    wc = db.query(WorkCenter).filter(WorkCenter.id == wc_id).first()
+    if not wc:
+        raise HTTPException(status_code=404, detail="Work Center not found")
+    if not _is_own_wc(wc, db.info.get("scope")):
+        raise HTTPException(status_code=403, detail="Shared work center is read-only")
+
+    if "workcenter_name" in payload:
+        wc.workcenter_name = payload["workcenter_name"]
+    if "shopfloor_name" in payload:
+        wc.shopfloor_name = payload["shopfloor_name"]
+
+    db.commit()
+    return {"message": "Work center updated successfully"}
+
+
+@app.delete("/api/workcenters/{wc_id}")
+def delete_workcenter(wc_id: int, db: Session = Depends(init_db), token_data=Depends(verify_token)):
+    wc = db.query(WorkCenter).filter(WorkCenter.id == wc_id).first()
+    if not wc:
+        raise HTTPException(status_code=404, detail="Work Center not found")
+    if not _is_own_wc(wc, db.info.get("scope")):
+        raise HTTPException(status_code=403, detail="Shared work center is read-only")
+
+    db.delete(wc)
+    db.commit()
+    return {"message": "Work center deleted successfully"}
+```
+
+## Order of changes
+1. Add the cache and helper (section 1) above `_scope()`.
+2. Replace `_scope()`, `get_scope()` and `_plant_clause()`.
+3. Replace the three endpoints.
+4. Restart the server.
+
+`SHARED_VISIBLE` is defined in section 1, and `_plant_clause()` only reads it when it runs, so the order inside the file doesn't matter. All the table classes come from `from Database_models import *` at the top of the file.
+
+I haven't run this against your database. Run the test from my last message with a real shopfloor admin.
